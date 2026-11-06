@@ -1,0 +1,354 @@
+name: win7-ult-x64-UpdatePack7R2
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 17 28 */6 *"
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+env:
+  TAG_NAME: win7-ultsp1-x64
+  FINAL_ISO_NAME: cn-win7-ultsp1-x64-UpdatePack7R2
+jobs:
+  Build-win7-UpdatePack7R2:
+    runs-on: windows-latest
+    timeout-minutes: 300
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Step-1 Initialize Workspace
+        shell: pwsh
+        working-directory: .
+        run: |
+          mkdir -Force original
+          mkdir -Force addons
+          mkdir -Force utils
+          mkdir -Force dist
+          mkdir -Force assets
+
+      - name: 1. Get Addons Files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        working-directory: ./addons
+        run: |
+          # DirectX_June2010 [http://komisar.gin.by/tools/u/]
+          gh release download win7-ult-x64 --repo vaesn/win-iso-archive --pattern "DirectX*.WA" --dir ./
+          # dotNetFx48
+          gh release download --repo abbodi1406/dotNetFx4xW7A --pattern "*.WA" --dir ./
+          # dotNetFx472
+          #gh release download 19.03.19 --repo abbodi1406/dotNetFx4xW7A --pattern "dotNetFx472*.WA" --dir ./
+          # dotNetFx48LP
+          gh release download 19.04.13 --repo abbodi1406/dotNetFx4xW7A --pattern "*CHS.WA" --dir ./
+          # dotNetFx472LP
+          #gh release download win7-ult-x64 --repo vaesn/win-iso-archive --pattern "*CHS.WA" --dir ./
+          # vcredist [https://gitlab.com/stdout12/adns/-/releases] 
+          curl -L -o vcredist_x64_Win7.WA "https://gitlab.com/-/project/11037551/uploads/8899c68cf5b5bfc7da7f04b73afa9f58/vcredist_x64_Win7_20250708.WA"
+          curl -L -o vcredist_x86_Win7.WA "https://gitlab.com/-/project/11037551/uploads/49d56348397669befad302f58070ab2f/vcredist_x86_Win7_20250708_r.WA"
+          # SmartFix
+          curl -L -o SmartFix.exe "https://smartfix.pro/SmartFix.exe"
+          gh release download win7-ult-x64 --repo vaesn/win-iso-archive --pattern "UpdatePack7R2.exe" --dir ./
+
+          Write-Host "下载完成，文件列表："
+          Get-ChildItem -File -Recurse
+
+      - name: 2. Get Utiles
+        shell: pwsh
+        working-directory: ./utils
+        run: |
+          curl -L -o oscdimg.zip https://github.com/officialmofabs/oscdimg/raw/main/oscdimg-amd64.zip
+          # curl -L -o wimlib.zip https://wimlib.net/downloads/wimlib-1.14.5-windows-x86_64-bin.zip
+          7z x oscdimg.zip -o"oscdimg" -y
+          # 7z x wimlib.zip -o"wimlib" -y
+          Write-Host "下载完成，文件列表："
+          Get-ChildItem -File -Recurse
+
+      - name: 3. Get ISO Files
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        working-directory: ./original
+        run: |
+          gh release download win7-ult-x64 --repo vaesn/win-iso-archive --pattern "*677408.7z.*" --dir ./
+          7z x *677408.7z.001 -y
+          Start-Sleep -Seconds 3
+          Rename-Item -Path "*677408.iso" -NewName "win7original.iso"
+          Remove-Item -Path "*677408.7z.*" -Force
+          7z x win7original.iso -o"win7original" -y
+          Start-Sleep -Seconds 3
+          Remove-Item -Path "*.iso" -Force
+          Write-Host "文件列表："
+          Get-ChildItem -File -Recurse
+
+      - name: 4. Extract Source ISO Ultimate Index=4
+        working-directory: ./original
+        shell: pwsh
+        run: |
+          #dism /Get-ImageInfo /ImageFile:"./win7original/sources/install.wim"
+          Get-WindowsImage -ImagePath "./win7original/sources/install.wim" | Format-Table ImageIndex, ImageName, ImageSize -AutoSize
+          dism /Export-Image `
+              /SourceImageFile:"./win7original/sources/install.wim" `
+              /SourceIndex:4 `
+              /DestinationImageFile:"./install.wim" `
+              /Compress:fast `
+              /LogPath:"./dism_export.log" | Out-Null
+          Write-Host "==========DISM Export Finished=========="
+          Remove-Item -Path "./win7original/sources/install.wim" -Force
+          Get-WindowsImage -ImagePath "./install.wim" | Format-Table ImageIndex, ImageName, ImageSize -AutoSize
+          Move-Item -Path "../win7-autounattend.xml" -Destination "./win7original/autounattend.xml" -Force
+          Move-Item -Path "./install.wim" -Destination "./win7original/sources/" -Force
+          Get-ChildItem -File -Recurse
+
+      - name: 5. Integrate Updates By UpdatePack7R2
+        shell: cmd
+        working-directory: ./addons
+        run: |
+          set "FULL_INSTALL_DIR=%GITHUB_WORKSPACE%\original\win7original\sources\install.wim"
+          set "FULL_BOOT_DIR=%GITHUB_WORKSPACE%\original\win7original\sources\boot.wim"
+          
+          echo FULL_INSTALL_DIR = %FULL_INSTALL_DIR%
+          echo FULL_BOOT_DIR = %FULL_BOOT_DIR%
+
+          .\UpdatePack7R2.exe /WimFile=%FULL_INSTALL_DIR% /Boot=%FULL_BOOT_DIR% /Index=* /NVMe /Optimize=esd
+
+          echo UpdatePack7R2 Done...
+
+      - name: 6. Repack to ISO
+        shell: pwsh
+        working-directory: .
+        run: |
+          #.\utils\oscdimg\oscdimg.exe -m -u2 -o -bootdata:2#p0,e,b.\original\win7original\boot\etfsboot.com#pEF,e,b.\original\win7original\efi\microsoft\boot\efisys.bin .\original\win7original .\dist\cn_win7_ultimate_sp1_x64_UpdatePack7R2_260115.iso -lcn_win7_ultimate_sp1_x64_UpdatePack7R2_260115
+
+          .\utils\oscdimg\oscdimg.exe `
+              -m `
+              -u2 `
+              -o `
+              -bootdata:2#p0,e,b.\original\win7original\boot\etfsboot.com#pEF,e,b.\original\win7original\efi\microsoft\boot\efisys.bin `
+              .\original\win7original `
+              .\dist\cn-win7-ultsp1-x64-UpdatePack7R2.iso `
+              -lCN_WIN7_ULT_X64_UP7R2
+
+      - name: 7. Split Archive
+        shell: pwsh
+        working-directory: .
+        run: |
+          $DistDir      = "assets"
+          $RevisionName = "win7-ultsp1-x64"
+          $MaxVolMB     = 1895
+          $Reserve      = 8
+          $MaxDiffMB    = 64
+          Remove-Item -Path "./original/win7original" -Recurse -Force
+          $Iso = Get-ChildItem -Path "./dist" -Filter "*.iso" -File | Select-Object -First 1
+
+          $BaseName  = $Iso.BaseName
+          $IsoLength = $Iso.Length
+          $IsoDir    = $Iso.DirectoryName
+          $IsoFull   = $Iso.FullName
+
+          $FullHash = (Get-FileHash -Path $IsoFull -Algorithm SHA256).Hash.ToLower()
+          $ShortHash = $FullHash.Substring($FullHash.Length - 8)
+          $NewFileName = "${BaseName}_${ShortHash}.iso"
+          $NewFilePath = Join-Path -Path $IsoDir -ChildPath $NewFileName
+          Rename-Item -Path $IsoFull -NewName $NewFileName -Force
+
+          $SizeInMB    = $IsoLength / 1MB
+          $SizeInGB    = $IsoLength / 1GB
+
+          $TotalMB = [Math]::Ceiling($SizeInMB)
+          $N       = [Math]::Ceiling($TotalMB / ($MaxVolMB - $Reserve))
+          $S       = [Math]::Ceiling($TotalMB / $N) + $Reserve
+          $Last    = $TotalMB - $S * ($N - 1)
+          $Diff    = $S - $Last
+
+          $VolumeSizeArg = "${S}M"
+
+          $EnvVars = @(
+            "ISO_SIZEMB={0:N2} MB" -f $SizeInMB
+            "ISO_SIZEGB={0:N2} GB" -f $SizeInGB
+            "VOLUME_SIZE=$VolumeSizeArg"
+            "VOLUME_COUNT=$N"
+            "VOLUME_LAST=${Last}M"
+            "VOLUME_DIFF=$Diff"
+            "ISO_NAME=$NewFileName"
+            "ISO_PATH=$NewFilePath"
+            "REVISION_NAME=$RevisionName"
+            "SHA256=$FullHash"
+          )
+          $EnvVars | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "  ISO Processing Information" -ForegroundColor Cyan
+          Write-Host "========================================" -ForegroundColor Cyan
+          @(
+            "文件名: $NewFileName"
+            "大小 : {0:N2} MB" -f $SizeInMB
+            "大小 : {0:N2} GB" -f $SizeInGB
+            "路径 : $NewFilePath"
+            "SHA256: $FullHash"
+            "分卷参数: -v$VolumeSizeArg"
+            "分卷数: $N"
+            "最后一卷: ${Last} MB"
+            "差值: $Diff MB"
+          ) | ForEach-Object { Write-Host "  $_" }
+          Write-Host "========================================" -ForegroundColor Cyan
+
+          $OutputZipPath = "./assets/cn-win7-ultsp1-x64-UpdatePack7R2.7z"
+          Write-Host "VolumeSizeArg : 7z a -t7z -v$VolumeSizeArg -mx=0 $OutputZipPath $NewFilePath"
+
+          & 7z a -t7z -v"$VolumeSizeArg" -mx=0 -bso0 -bsp0 "$OutputZipPath" "$NewFilePath"
+
+          Write-Host "Generated archive: $OutputZipPath"
+          Get-ChildItem "./assets" -File -ErrorAction SilentlyContinue | Sort-Object Name | ForEach-Object {
+            Write-Host ("  {0}  {1:N2} MB" -f $_.Name, ($_.Length / 1MB))
+          }
+          Write-Host "Split Archive Done..." -ForegroundColor Green
+
+          $vols = Get-ChildItem "./assets/*.7z.*"
+          $max = ($vols | Measure-Object Length -Maximum).Maximum / 1MB
+          $min = ($vols | Measure-Object Length -Minimum).Minimum / 1MB
+          Write-Host ("最大卷: {0:N2} MB" -f $max)
+          Write-Host ("最小卷: {0:N2} MB" -f $min)
+          Write-Host ("差值  : {0:N2} MB" -f ($max - $min))
+
+          Remove-Item -Path "./dist/*Pack7R2.iso" -Force
+
+          Move-Item -Path "C:/WINDOWS/UpdatePack7.log" -Destination "./assets/UpdatePack7.log" -Force -ErrorAction SilentlyContinue
+          Move-Item -Path "./original/dism_export.log" -Destination "./assets/dism_export.log" -Force -ErrorAction SilentlyContinue
+
+          $repo = $env:GITHUB_REPOSITORY
+          $tag  = $RevisionName
+          $baseUrl = "https://v4.gh-proxy.org/https://github.com/$repo/releases/download/$tag"
+          $parts = @(
+            Get-ChildItem -Path $DistDir -File |
+              Where-Object { $_.Name -match '\.7z\.\d+$' } |
+              Sort-Object { [int]($_.Name -replace '^.*\.7z\.', '') }
+          )
+          if ($parts.Count -eq 0) {
+            throw "No 7z volume files found in $DistDir"
+          }
+          $firstPart = $parts[0].Name
+          $lastPart  = $parts[-1].Name
+          $partCount = $parts.Count
+          $tableRows = ($parts | ForEach-Object {
+            $name = $_.Name
+            $urlName = [uri]::EscapeDataString($name)
+            $idx = [int]($name -replace '^.*\.7z\.', '')
+            $ext = [regex]::Match($name, '\.7z\.\d+$').Value
+            "| $idx | ``$name`` | [下载$ext]($baseUrl/$urlName) |"
+          }) -join "`n"
+          $downloadLinks = @(
+            "| 序号 | 分卷 | 链接 |"
+            "| --- | --- | --- |"
+            $tableRows
+          ) -join "`n"
+          @(
+            "FIRST_PART=$firstPart"
+            "LAST_PART=$lastPart"
+            "PART_COUNT=$partCount"
+            "DOWNLOAD_BASE_URL=$baseUrl"
+            "DOWNLOAD_LINKS<<EOF"
+            $downloadLinks
+            "EOF"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "  Dynamic Download Links" -ForegroundColor Cyan
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "Base URL      : $baseUrl"
+          Write-Host "First Part    : $firstPart"
+          Write-Host "Last Part     : $lastPart"
+          Write-Host "Part Count    : $partCount"
+          Write-Host "Download Links:"
+          Write-Host $downloadLinks
+          Write-Host "========================================" -ForegroundColor Cyan
+
+      - name: 8. Delete Old Release
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: gh release delete "${{ env.TAG_NAME }}" --cleanup-tag -y || true
+
+      - name: 9. Delete past completed runs of this workflow
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh run list \
+            --repo "${{ github.repository }}" --workflow "${{ github.workflow }}" --limit 30 \
+            --json databaseId,status \
+            --jq '.[] | select(.status=="completed") | .databaseId' | while read -r id; do
+              [ -z "$id" ] && continue
+              [ "$id" = "${{ github.run_id }}" ] && continue
+              gh run delete "$id" --repo "${{ github.repository }}" || true
+            done
+
+      - name: 10. Build New Release
+        uses: softprops/action-gh-release@v3
+        with:
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          body: |
+            ## ${{ env.FINAL_ISO_NAME }}
+            - **ARTIFACT**: ${{ env.ISO_NAME }}
+            - **SHA256**: ${{ env.SHA256 }}
+            - **ORIGINAL**: cn_windows_7_ultimate_with_sp1_x64_dvd_u_677408.iso
+            - **File Size**: ${{ env.ISO_SIZEMB }} 、 ${{ env.ISO_SIZEGB }}
+            - **Volume Size**: ${{ env.VOLUME_SIZE }}
+            - **Volume Count**: ${{ env.PART_COUNT }}
+            - **Tools**: UpdatePack7R2-26.1.15.exe、SmartFix、 dotNetFx48、vcredist、 autounattend.xml
+            ---
+            ### 📦 下载说明
+            使用 7-Zip 进行分卷压缩，每卷 ${{ env.VOLUME_SIZE }}，共 ${{ env.PART_COUNT }} 卷。
+
+            **分卷下载链接**：
+
+            ${{ env.DOWNLOAD_LINKS }}
+
+            **下载方式**:
+            1. 下载以上所有 `.7z.001`, `.7z.002`,`.7z.003` ... 等后缀的文件。
+            2. 确保所有文件位于同一文件夹。
+            3. 使用 7-Zip 解压 `${{ env.FIRST_PART }}` 即可获得完整的 ISO 文件。
+            4. 使用 `https://gh-proxy.com/` 加速下载
+            ---
+            > ⚠️ **Note**: This is a multi-volume archive (.7z.001, .7z.002...). Please download all parts before extracting.
+          tag_name: ${{ env.TAG_NAME }}
+          name: ${{ env.FINAL_ISO_NAME }}
+          files: |
+            ./assets/*.7z.*
+            ./assets/*.log
+
+      - name: 11. Update README
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $newTimeNOW = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+          $fileName = "${{ env.ISO_NAME }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for ($i = 0; $i -lt 5; $i++) {
+              git fetch origin main
+              git reset --hard origin/main
+              $readmeOriginal = Get-Content README.md -Raw -Encoding utf8
+              $repo = $env:GITHUB_REPOSITORY
+              $RELEASE_URL = "https://github.com/$repo/releases/tag/${{ env.TAG_NAME }}"
+              $link  = '[{0}]({1})' -f $fileName, $RELEASE_URL
+              $replacement = "<!-- ${{ env.TAG_NAME }} -->`n$link`n`n($newTimeNOW UTC)`n<!-- /${{ env.TAG_NAME }} -->"
+              $readmeUpdated = [regex]::Replace(
+                  $readmeOriginal,
+                  '(?s)(<!-- ${{ env.TAG_NAME }} -->).*?(<!-- /${{ env.TAG_NAME }} -->)',
+                  { $replacement }
+              )
+              if ($readmeUpdated -eq $readmeOriginal) { break }
+              [IO.File]::WriteAllText("$PWD/README.md", $readmeUpdated, [Text.UTF8Encoding]::new($false))
+              git add README.md
+              git commit -m "update"
+              git push
+              if ($LASTEXITCODE -eq 0) { break }
+          }

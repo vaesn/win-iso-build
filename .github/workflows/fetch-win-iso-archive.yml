@@ -1,0 +1,699 @@
+# =============================================================================
+# 工作流名称：fetch-win-iso-x64
+# -----------------------------------------------------------------------------
+# 功能：在仓库 A 上手动触发，下载 Windows ISO，按大小自动决定"直传 or 分卷"，
+#       然后把产物上传到仓库 B 的 Release（B 是纯存档仓库）。
+#
+# 前置配置（一次性）：
+#   仓库 A 侧
+#     - Settings → Secrets and variables → Actions → Variables
+#         Name: B_REPO       Value: owner/repo-b
+#     - Settings → Secrets and variables → Actions → Secrets
+#         Name: B_REPO_TOKEN Value: <PAT>
+#   仓库 B 侧
+#     - 至少有一个 commit（空仓库无法创建 Release）
+# =============================================================================
+name: fetch-win-iso-archive
+
+# =============================================================================
+# 触发方式：仅手动（workflow_dispatch）
+# -----------------------------------------------------------------------------
+# 用户可以在 Actions 页面点 "Run workflow" 按钮，并在弹窗里填写两个输入项。
+# inputs 下每个字段的含义：
+#   description  输入框旁的说明文字（帮助用户理解填什么）
+#   required     是否必填；true 表示不填就无法点击确认
+#   type         数据类型；string 表示纯文本
+# =============================================================================
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release Tag (e.g., win10-22h2-x64)"
+        required: true
+        type: string
+      iso_url:
+        description: "ISO Download URL"
+        required: true
+        type: string
+      delete_old_release:
+        description: "Delete existing Release with same tag before upload (uncheck to APPEND to it)"
+        required: false
+        type: boolean
+        default: false
+      delete_old_runs:
+        description: "Delete past completed runs of this workflow (keep Actions page clean)"
+        required: false
+        type: boolean
+        default: false
+
+# =============================================================================
+# 权限声明
+# -----------------------------------------------------------------------------
+# 这里的 permissions 只作用于【当前仓库（仓库 A）】。
+# GITHUB_TOKEN 是 Actions 自动注入的临时令牌，权限严格受这段配置限制。
+#
+#   contents: read    —— checkout 需要（只读仓库内容）
+#   actions:  write   —— Step-4 删除本仓库的历史 run 记录需要
+#
+# ⚠️ 跨仓库操作（写入仓库 B）不能用 GITHUB_TOKEN，
+#    必须使用 Personal Access Token（PAT），
+#    因为 GITHUB_TOKEN 的作用域永远限制在触发它的仓库内。
+# =============================================================================
+permissions:
+  contents: read
+  actions: write
+
+# =============================================================================
+# 并发控制
+# -----------------------------------------------------------------------------
+# 同一个 workflow 名称下，任何时刻只允许一个 run 在执行。
+#   group: ${{ github.workflow }}   用工作流名作为锁的 key
+#   cancel-in-progress: false       新 run 排队等待，而不是取消正在跑的
+#
+# 目的：避免两个 run 同时下载几十 GB 的 ISO 把 runner 磁盘撑爆。
+# =============================================================================
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  fetch-win-iso-archive:
+    # 使用 GitHub 托管的最新 Ubuntu 运行器
+    runs-on: ubuntu-latest
+
+    # 整个 job 最长运行 5 小时，超时自动失败
+    # 下载 5-6 GB ISO + 分卷通常需要 30-60 分钟，300 分钟绰绰有余
+    timeout-minutes: 300
+
+    # ------------------------------------------------------------------------
+    # job 级环境变量：这里定义的变量所有步骤都能读到
+    # B_REPO 从仓库 Variable 读取，值形如 owner/repo-b
+    # ------------------------------------------------------------------------
+    env:
+      B_REPO: ${{ vars.B_REPO }}
+
+    steps:
+      # ======================================================================
+      # 步骤 0：Checkout 仓库 A
+      # ======================================================================
+      # 本工作流逻辑上不需要仓库 A 的代码，保留 checkout 是为了：
+      #   1) 让工作区存在，避免某些第三方 action 在无 .git 时行为异常
+      #   2) 便于以后扩展（例如读取仓库内的配置文件）
+      # ======================================================================
+      #- name: Checkout Repository
+      #  uses: actions/checkout@v7
+
+      # ======================================================================
+      # 步骤 0.5：配置校验（在下载几十 GB 之前先发现配置错误）
+      # ======================================================================
+      # 校验项：
+      #   1) B_REPO 是否已配置        —— 缺失会静默生成错误链接
+      #   2) B_REPO 格式是否为 owner/repo（必须含且只含一个斜杠）
+      #   3) B_REPO_TOKEN 是否已配置  —— 缺失会在上传时才报错，浪费几小时
+      # ======================================================================
+      - name: Validate configuration
+        shell: bash
+        env:
+          # 把 Secret 传到环境变量，方便 shell 读取
+          # 用 Secret 而不是 env 直接注入，日志里会自动打码
+          B_REPO_TOKEN: ${{ secrets.B_REPO_TOKEN }}
+        run: |
+          # 严格模式：命令出错即停 / 用到未定义变量报错 / 管道任一环失败整体失败
+          set -euo pipefail
+
+          # ---------- 检查 B_REPO ----------
+          # ${B_REPO:-} 使用 :- 语法：B_REPO 未定义或为空时返回空串，避免 -u 报错
+          if [[ -z "${B_REPO:-}" ]]; then
+            # ::error:: 前缀是 GitHub Actions 的特殊标记，会在日志里高亮显示
+            echo "::error::Repository Variable B_REPO is not set."
+            echo "::error::请到 仓库 A → Settings → Secrets and variables → Actions → Variables 添加："
+            echo "::error::  Name:  B_REPO"
+            echo "::error::  Value: owner/repo-b   （目标存档仓库）"
+            exit 1
+          fi
+
+          # ---------- 检查 B_REPO 格式 ----------
+          # 正则 ^[^/]+/[^/]+$ 的含义：
+          #   ^       字符串开始
+          #   [^/]+   一个或多个"非斜杠"字符（owner 部分）
+          #   /       一个斜杠
+          #   [^/]+   一个或多个"非斜杠"字符（repo 部分）
+          #   $       字符串结束
+          # 即：必须是 owner/repo 且只含一个斜杠
+          if [[ ! "$B_REPO" =~ ^[^/]+/[^/]+$ ]]; then
+            echo "::error::B_REPO must be 'owner/repo' format, got: $B_REPO"
+            exit 1
+          fi
+
+          # ---------- 检查 B_REPO_TOKEN ----------
+          if [[ -z "${B_REPO_TOKEN:-}" ]]; then
+            echo "::error::Repository Secret B_REPO_TOKEN is not set."
+            echo "::error::请到 仓库 A → Settings → Secrets and variables → Actions → Secrets 添加："
+            echo "::error::  Name:  B_REPO_TOKEN"
+            echo "::error::  Value: <PAT，需对目标仓库有 Contents: Read and write 权限>"
+            exit 1
+          fi
+
+          # ---------- 全部通过，打印配置摘要 ----------
+          # ${#B_REPO_TOKEN} 是变量长度（bash 内置），只打印长度不打印内容
+          echo "Configuration OK:"
+          echo "  Source repo (this) = $GITHUB_REPOSITORY"
+          echo "  Target repo        = $B_REPO"
+          echo "  Token              = (length ${#B_REPO_TOKEN})"
+
+      # ======================================================================
+      # 步骤 1：安装依赖
+      # ======================================================================
+      # ubuntu-latest 镜像本身已预装 aria2 / p7zip-full / jq，
+      # 这里显式 apt install 是为了：
+      #   1) 让工作流意图更清晰（一眼看出依赖哪些外部工具）
+      #   2) 未来镜像精简时不至于断链
+      #   3) 保证工具是最新可用版本
+      # 代价：几十秒安装时间，可接受。
+      # ======================================================================
+      - name: Install dependencies
+        shell: bash
+        run: |
+          # 刷新软件包索引（不 update 直接 install 有可能找不到包）
+          sudo apt-get update
+          # -y 自动对所有询问回答 yes
+          # 三个工具：
+          #   aria2       多线程下载器，提供 aria2c 命令
+          #   p7zip-full  提供 7z 命令
+          #   jq          命令行 JSON 工具，用于 URL 编码
+          sudo apt-get install -y aria2 p7zip-full jq
+
+      # ======================================================================
+      # 步骤 2：下载 ISO
+      # ======================================================================
+      # 用 aria2c 多线程下载到 ./original 目录。
+      # 不指定 --out，让 aria2c 依据 URL 或 Content-Disposition 自动命名。
+      # ======================================================================
+      - name: Step-1 Download ISO
+        # env 块把 workflow input 转成 shell 环境变量
+        env:
+          ISO_URL: ${{ github.event.inputs.iso_url }}
+        shell: bash
+        run: |
+          # 严格模式：
+          #   -e           任意命令返回非 0 立即退出整个脚本
+          #   -u           使用未定义变量时报错（防止拼写错误静默继续）
+          #   -o pipefail  管道中任意一环失败，整个管道算失败
+          #                （默认只看最后一环的退出码，会掩盖前面的错误）
+          set -euo pipefail
+
+          # 清空并重建 ./original 目录
+          # rm -rf：强制递归删除，目录不存在也不报错
+          # mkdir -p：创建目录，父目录不存在也一并创建，已存在不报错
+          rm -rf original
+          mkdir -p original
+
+          # ------------------------------------------------------------------
+          # aria2c 命令详解（行尾的 \ 是 bash 续行符，表示命令未完）
+          # ------------------------------------------------------------------
+          # --dir=./original                 下载文件保存目录
+          # --split=16                       把文件切成 16 段并行下载
+          # --max-connection-per-server=16   对每台服务器最多 16 个连接
+          # --min-split-size=8M              单段最小 8 MiB（太小反而拖慢）
+          # --file-allocation=none           不预分配磁盘（对 SSD 友好）
+          # --continue=true                  支持断点续传（重跑时接着下）
+          # --max-tries=5                    失败最多重试 5 次
+          # --retry-wait=10                  每次重试间隔 10 秒
+          # --timeout=60                     下载超时 60 秒
+          # --connect-timeout=30             连接超时 30 秒
+          # --disk-cache=64M                 磁盘缓存 64 MiB
+          # --console-log-level=warn         控制台日志级别：只显示 warn 及以上
+          # --summary-interval=3             每 3 秒打印一次进度摘要
+          # --async-dns=true                 异步 DNS 解析（不阻塞下载）
+          # --enable-http-pipelining=true    启用 HTTP 管线化（提高吞吐）
+          # --content-disposition=true       遵循服务器的 Content-Disposition 文件名
+          # "$ISO_URL"                       下载地址，用双引号包裹防止空格问题
+          # --max-overall-download-limit=2M \
+          aria2c \
+            --dir=./original \
+            --split=32 \
+            --max-connection-per-server=16 \
+            --min-split-size=16M \
+            --file-allocation=none \
+            --continue=true \
+            --max-tries=8 \
+            --retry-wait=60 \
+            --timeout=120 \
+            --connect-timeout=60 \
+            --disk-cache=64M \
+            --console-log-level=warn \
+            --summary-interval=3 \
+            --async-dns=true \
+            --enable-http-pipelining=true \
+            --content-disposition=true \
+            --max-file-not-found=10 \
+            --lowest-speed-limit=10K \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36" \
+            "$ISO_URL"
+
+          # 打印 ./original 下的文件，便于排查 aria2c 实际命名了什么
+          # find 参数：
+          #   -maxdepth 1   不递归子目录（只看当前层）
+          #   -type f       只找普通文件（排除目录、符号链接等）
+          #   -printf       自定义输出格式：
+          #                   %f  文件名（不含目录）
+          #                   %s  文件字节大小
+          #                   空格和括号是普通字符原样输出
+          echo "Downloaded files in ./original:"
+          find ./original -maxdepth 1 -type f -printf '  %f (%s bytes)\n'
+
+      # ======================================================================
+      # 步骤 3：判断大小 → 直传 or 7z 分卷 → 生成下载链接表
+      # ======================================================================
+      # 阈值 MaxVolMB=1895 MiB，配合 v4.gh-proxy 单文件 2 GiB 限制留余量。
+      # 小文件直传；大文件用 7z 以"存储模式"分卷（不压缩，因为 ISO 已是压缩数据）。
+      # ======================================================================
+      - name: Step-2 Compress with 7-Zip
+        env:
+          TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # ---------- 分卷参数 ----------
+          # MaxVolMB：单卷硬上限（MiB）
+          # Reserve ：每卷预留余量（MiB），吸收 7z 头部开销
+          # ASSETS  ：最终上传目录
+          MaxVolMB=1895
+          Reserve=8
+          ASSETS="./assets"
+
+          # mapfile -t 数组名 < <(命令) 语法拆解：
+          #   mapfile         bash 内建命令，把输入的每一行存入数组
+          #   -t              去掉每行末尾的换行符
+          #   数组名          存储结果的数组名
+          #   < <(...)        进程替换：把 (...) 命令的输出当成一个只读文件
+          #
+          # 第一组：所有普通文件（用于兜底：无 .iso 但只有一个文件时使用）
+          mapfile -t all_files < <(find ./original -maxdepth 1 -type f | sort)
+          # 第二组：只匹配 .iso 后缀（-iname 忽略大小写）
+          mapfile -t iso_files < <(find ./original -maxdepth 1 -type f -iname '*.iso' | sort)
+
+          # ${#数组[@]} 表示数组元素个数
+          # 情况一：没找到 .iso 文件
+          if (( ${#iso_files[@]} == 0 )); then
+            # 如果只下到一个文件，就把它当 ISO 用（兜底）
+            if (( ${#all_files[@]} == 1 )); then
+              echo "::warning::No *.iso file found; using the only downloaded file as ISO: ${all_files[0]}"
+              # 数组重新赋值：只含这一个文件
+              iso_files=("${all_files[0]}")
+            else
+              # 既没有 .iso，下载到的文件又不是唯一 → 明确报错
+              echo "::error::No ISO file (*.iso) found in ./original" >&2
+              echo "::error::请确认 URL 文件名以 .iso 结尾，或服务器 Content-Disposition 里含 .iso 文件名" >&2
+              # 打印实际文件帮助排查；|| true 防止 find 本身出错导致脚本意外退出
+              find ./original -maxdepth 1 -type f -printf '  present: %f\n' >&2 || true
+              exit 1
+            fi
+          fi
+
+          # 情况二：找到多个 .iso（少见），只用第一个并给警告
+          if (( ${#iso_files[@]} > 1 )); then
+            echo "::warning::Multiple ISO files found, using the first one"
+            printf '  - %s\n' "${iso_files[@]}"
+          fi
+
+          # ---------- 提取 ISO 元信息 ----------
+          iso_file="${iso_files[0]}"                    # 完整路径
+          iso_name="$(basename "$iso_file")"            # 文件名（含扩展名）
+          iso_base="${iso_name%.*}"                     # 去掉最后一段扩展名
+                                                        #   ${VAR%pattern} 从右边删除最短匹配
+          iso_length="$(stat -c%s "$iso_file")"         # 字节数（-c%s 只输出 size 字段）
+          iso_full_path="$(realpath "$iso_file")"       # 绝对路径（规范化符号链接）
+
+          # 极端情况：文件名为 ".iso" 时 iso_base 为空
+          [[ -z "$iso_base" ]] && iso_base="iso_image"
+
+          # ---------- 计算 SHA256 ----------
+          # sha256sum 输出格式：<hash>  <文件名>
+          # awk '{print $1}' 取第一列，即哈希值
+          iso_full_hash="$(sha256sum "$iso_file" | awk '{print $1}')"
+
+          # ---------- 单位换算 ----------
+          # read -r a b c < <(...) 语法：
+          #   把命令输出的空白分隔字段依次赋给 a、b、c
+          #   -r 禁止反斜杠转义（防止文件名含 \ 时误解析）
+          #
+          # awk 计算：
+          #   -v b="$iso_length"   把 shell 变量注入 awk（-v 选项）
+          #   mb    字节 → MiB（除以 1048576 = 1024*1024）
+          #   gb    字节 → GiB（除以 1073741824 = 1024^3）
+          #   total mb 向上取整的整数 MiB
+          #         (mb == int(mb)) ? mb : int(mb)+1
+          #         如果 mb 是整数就用它，否则取整数部分加 1
+          #   printf "%.2f %.2f %d\n" 输出两个保留两位小数的浮点数和一个整数
+          read -r iso_size_mb iso_size_gb iso_total_mb < <(
+            awk -v b="$iso_length" 'BEGIN {
+              mb = b/1048576;
+              gb = b/1073741824;
+              total = (mb == int(mb)) ? mb : int(mb)+1;
+              printf "%.2f %.2f %d\n", mb, gb, total
+            }'
+          )
+
+          # 决策阈值：ISO ≤ 此值则直传，> 则分卷
+          local_vol=$(( MaxVolMB - Reserve ))    # 1895 - 16 = 1879
+
+          # ---------- 把关键变量写入 GITHUB_ENV ----------
+          # >> "$GITHUB_ENV" 是 GitHub Actions 机制：
+          #   往这个文件里追加 "KEY=VALUE"，后续步骤就能通过
+          #   ${{ env.KEY }} 或 $KEY 引用。
+          # { ... } 是 bash 的"命令组"，把多个命令的输出合并重定向到同一文件
+          {
+            echo "ISO_SIZEMB=${iso_size_mb}"
+            echo "ISO_SIZEGB=${iso_size_gb}"
+            echo "ISO_NAME=${iso_name}"
+            echo "ISO_PATH=${iso_full_path}"
+            echo "TAG=${TAG}"
+            echo "SHA256=${iso_full_hash}"
+          } >> "$GITHUB_ENV"
+
+          # ---------- 打印概要（人工核对用） ----------
+          echo "========================================"
+          echo "  ISO Processing Information"
+          echo "========================================"
+          # printf '  %s\n' a b c ：按格式对每个参数输出一行
+          printf '  %s\n' \
+            "文件名  : $iso_name" \
+            "大小    : ${iso_size_mb} MB / ${iso_size_gb} GB" \
+            "路径    : $iso_full_path" \
+            "SHA256  : $iso_full_hash" \
+            "阈值    : ${local_vol} MB"
+          echo "========================================"
+
+          # ---------- 清空并重建 ./assets ----------
+          # 直接 rm -rf + mkdir，保证 Step-5 上传时只包含本次产物
+          rm -rf "$ASSETS"
+          mkdir -p "$ASSETS"
+
+          # ---------- 决策分支 ----------
+          if (( iso_total_mb <= local_vol )); then
+            # ========== 小文件分支：直接上传 ==========
+            SPLIT_MODE="false"
+            N=1
+            S=$iso_total_mb
+            Last=$iso_total_mb
+            Diff=0
+            VolumeSizeArg="n/a"
+            echo "ISO size ${iso_total_mb} MB <= ${local_vol} MB, upload as-is"
+
+            # 优先硬链接（同一文件系统内零拷贝，几乎瞬间完成）
+            # 失败（比如跨文件系统）时回退到 cp 复制
+            # 2>/dev/null 抑制 ln 的错误信息，避免日志干扰
+            # \ 续行 + || 逻辑：整行等价于 (ln ...) || (cp ...)
+            ln -f "$iso_full_path" "$ASSETS/$iso_name" 2>/dev/null \
+              || cp -f "$iso_full_path" "$ASSETS/$iso_name"
+          else
+            # ========== 大文件分支：7z 分卷 ==========
+            SPLIT_MODE="true"
+
+            # N = ceil(iso_total_mb / local_vol)
+            # 整数除法自动向下取整，"加 (除数-1) 再除"实现向上取整
+            N=$(( (iso_total_mb + local_vol - 1) / local_vol ))
+            (( N < 1 )) && N=1    # 至少 1 卷（防极端输入）
+
+            # S = ceil(iso_total_mb / N) + Reserve
+            # 在平均分配基础上每卷多 16 MiB，抵消 7z 头部开销
+            S=$(( (iso_total_mb + N - 1) / N + Reserve ))
+            # 最后一卷大小 = 总量 - 前面每卷体积 × (卷数 - 1)
+            Last=$(( iso_total_mb - S * (N - 1) ))
+            Diff=$(( S - Last ))
+            VolumeSizeArg="${S}M"
+
+            echo "ISO size ${iso_total_mb} MB > ${local_vol} MB, split into ${N} volumes (-v${VolumeSizeArg})"
+
+            # 括号 () 创建子 shell：
+            #   子 shell 内 cd 只影响自己，退出后自动回到原工作目录
+            # 7z 参数：
+            #   a            add，添加文件到新归档
+            #   -t7z         指定归档格式 7z
+            #   -v"${S}M"    分卷大小（M 后缀 = MiB）
+            #   -mx=0        压缩级别 0 = 存储模式（不压缩）
+            #                因为 ISO 本身已压缩，再压没意义且耗时
+            # 归档名为 ../assets/<iso_base>（无扩展名，7z 会自动加 .7z）
+            # 目标文件为 $iso_name（相对路径，使归档内不包含绝对路径）
+            (
+              cd ./original
+              7z a -t7z -v"$VolumeSizeArg" -mx=0 "../assets/$iso_base" "$iso_name"
+            )
+          fi
+
+          # 把分卷元信息写入 GITHUB_ENV
+          {
+            echo "SPLIT_MODE=${SPLIT_MODE}"
+            echo "VOLUME_SIZE=${VolumeSizeArg}"
+            echo "VOLUME_COUNT=${N}"
+            echo "VOLUME_LAST=${Last}M"
+            echo "VOLUME_DIFF=${Diff}"
+          } >> "$GITHUB_ENV"
+
+          # ---------- 分卷尺寸报告 ----------
+          if [[ "$SPLIT_MODE" == "true" ]]; then
+            # shopt -s nullglob：
+            #   通配符无匹配时展开为空数组，而不是字面量 "*.7z.*"
+            #   避免下面 ${#vols[@]} == 0 判断出错
+            shopt -s nullglob
+            vols=("$ASSETS"/*.7z.*)
+            shopt -u nullglob    # 恢复默认行为，避免影响后续通配符
+
+            if (( ${#vols[@]} > 0 )); then
+              # stat -c%s 一次性输出多个文件的大小，每行一个
+              # sort -n   按数字排序
+              # tail -n1  取最大值
+              # head -n1  取最小值
+              max_bytes="$(stat -c%s "${vols[@]}" | sort -n | tail -n1)"
+              min_bytes="$(stat -c%s "${vols[@]}" | sort -n | head -n1)"
+              # awk 计算并打印每卷最大/最小/差值（MiB）
+              awk -v max="$max_bytes" -v min="$min_bytes" 'BEGIN {
+                printf "最大卷: %.2f MB\n最小卷: %.2f MB\n差值  : %.2f MB\n",
+                  max/1048576, min/1048576, (max-min)/1048576
+              }'
+            fi
+          else
+            # du -h 人类可读显示文件大小（如 "5.0G"）
+            # cut -f1 取第一列（tab 分隔）
+            echo "未分卷，直接上传：$iso_name ($(du -h "$ASSETS/$iso_name" | cut -f1))"
+          fi
+
+          # ==================================================================
+          # 构造 Markdown 下载链接表
+          # ==================================================================
+          # repo 用 B_REPO（目标仓库），因为 Release 会建在仓库 B，
+          # 下载链接必须指向仓库 B。
+          # base_url 前缀 https://v4.gh-proxy.org/ 是加速代理，
+          # 后面接原始 GitHub 下载地址。
+          # ==================================================================
+          repo="$B_REPO"
+          base_url="https://v4.gh-proxy.org/https://github.com/$repo/releases/download/$TAG"
+
+          table_rows=""
+
+          if [[ "$SPLIT_MODE" == "true" ]]; then
+            # 多卷情况：按卷号排序
+            # awk -F'.' 以点分割，$NF 是最后一个字段（如 "001"、"002"）
+            # printf "%010d\t%s\n" 把卷号补零到 10 位，再 tab 原文件名
+            #   补零目的：sort -n 按数字排序时 "0000000002" < "0000000010"
+            #   如果不补零，sort -n 会把 "10" 排在 "2" 前面（数字序）
+            # sort -n  按数字排序
+            # cut -f2- 取第二列及之后（去掉用于排序的补零列）
+            mapfile -t parts < <(
+              find "$ASSETS" -maxdepth 1 -type f -name '*.7z.*' -printf '%f\n' |
+                awk -F'.' '{ n=$NF; if (n ~ /^[0-9]+$/) printf "%010d\t%s\n", n, $0 }' |
+                sort -n |
+                cut -f2-
+            )
+
+            if (( ${#parts[@]} == 0 )); then
+              echo "::error::No 7z volume files found in $ASSETS" >&2
+              exit 1
+            fi
+
+            first_part="${parts[0]}"
+            last_part="${parts[-1]}"    # ${arr[-1]} 取最后一个元素（bash 4.3+）
+            part_count="${#parts[@]}"
+
+            for name in "${parts[@]}"; do
+              # ${name##*.7z.} 从左边贪婪匹配并删除最长前缀 "*.7z."
+              # 例如 "Win10.7z.003" → "003"
+              # 10# 前缀强制按十进制解析
+              #   如果不加 10#，"008" 会被 bash 当八进制解析而报错
+              idx=$(( 10#${name##*.7z.} ))
+
+              # jq -nr --arg s "$name" '$s|@uri'
+              #   -n        不读取输入，直接执行 filter
+              #   -r        原始输出（不加引号）
+              #   --arg s   定义变量 $s = name 的值
+              #   @uri      对字符串做百分号编码
+              # 目的：文件名里的空格、括号、中文等在 URL 里非法，
+              #       编码后变成 %20 等安全形式
+              url_name="$(jq -nr --arg s "$name" '$s|@uri')"
+
+              # $'\n' 是 bash 的 ANSI-C 转义，代表真实换行符
+              # += 追加字符串
+              table_rows+="| $idx | \`$name\` | [下载]($base_url/$url_name) |"$'\n'
+            done
+          else
+            # 单文件情况
+            first_part="$iso_name"
+            last_part="$iso_name"
+            part_count=1
+            url_name="$(jq -nr --arg s "$iso_name" '$s|@uri')"
+            table_rows+="| 1 | \`$iso_name\` | [下载]($base_url/$url_name) |"$'\n'
+          fi
+
+          # ${table_rows%$'\n'} 从右边删除最短匹配的一个换行符
+          # 去掉表格末尾多余的空行
+          table_rows="${table_rows%$'\n'}"
+
+          # 拼出完整 Markdown 表格（含表头）
+          # printf '%s\n%s\n%s' 输出三个参数各一行
+          download_links="$(printf '%s\n%s\n%s' \
+            '| Volume | File Name | Link |' \
+            '| ------ | --------- | ---- |' \
+            "$table_rows")"
+
+          # 多行环境变量写入 GITHUB_ENV
+          # 语法 KEY<<EOF ... EOF 是 GitHub Actions 官方支持的多行形式
+          # 内容中所有行（直到遇到 EOF 单独一行）都会成为变量的值
+          {
+            echo "FIRST_PART=$first_part"
+            echo "LAST_PART=$last_part"
+            echo "PART_COUNT=$part_count"
+            echo "DOWNLOAD_BASE_URL=$base_url"
+            echo "DOWNLOAD_LINKS<<EOF"
+            printf '%s\n' "$download_links"
+            echo "EOF"
+          } >> "$GITHUB_ENV"
+
+          # 再打印一次到控制台，方便人工核对
+          echo "========================================"
+          echo "  Dynamic Download Links"
+          echo "========================================"
+          echo "Base URL      : $base_url"
+          echo "First Part    : $first_part"
+          echo "Last Part     : $last_part"
+          echo "Part Count    : $part_count"
+          printf '%s\n' "$download_links"
+          echo "========================================"
+
+      # ======================================================================
+      # 步骤 4：删除仓库 B 上的同名旧 Release（连带 tag）
+      # ======================================================================
+      # 目的：重复运行同一个 tag 时先清掉旧的，避免冲突。
+      # 关键点：
+      #   1) GH_TOKEN 用 PAT（跨仓库必须）
+      #   2) --repo "$B_REPO" 显式指明目标仓库
+      #   3) --cleanup-tag 同时删除 git tag（否则 tag 残留会导致下次冲突）
+      #   4) || true 兜底：旧 Release 不存在时 gh 返回非 0，不能因此中断流程
+      #
+      # continue-on-error: true 让本步骤失败也不影响后续步骤
+      # ======================================================================
+      - name: Step-3 Delete Old Release on target repo
+        if: ${{ github.event.inputs.delete_old_release == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.B_REPO_TOKEN }}
+          TAG: ${{ github.event.inputs.tag }}
+        shell: bash
+        run: |
+          # gh release delete <tag> --repo <owner/repo> --cleanup-tag -y
+          #   --repo         目标仓库
+          #   --cleanup-tag  同时删除对应 git tag
+          #   -y             自动确认所有询问
+          gh release delete "$TAG" --repo "$B_REPO" --cleanup-tag -y || true
+
+      # ======================================================================
+      # 步骤 5：清理仓库 A 本工作流的历史已完成 run 记录
+      # ======================================================================
+      # 目的：避免 Actions 页面被反复触发产生的 run 列表无限堆积。
+      # 只操作仓库 A 自己的 run，用默认 GITHUB_TOKEN 即可。
+      # ======================================================================
+      - name: Step-4 Delete past completed runs of this workflow
+        if: ${{ github.event.inputs.delete_old_runs == 'true' }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        shell: bash
+        run: |
+          # 注意这里不用 -e：可能没有需要删除的历史运行
+          # -u 和 -o pipefail 保留
+          set -uo pipefail
+
+          # 从 GITHUB_WORKFLOW_REF 提取当前工作流文件名
+          # 值形如：owner/repo/.github/workflows/foo.yml@refs/heads/main
+          #   ${VAR#*/.github/workflows/}  从左边删除最短匹配的前缀
+          #                                 → "foo.yml@refs/heads/main"
+          #   ${VAR%@*}                    从右边删除最长匹配的后缀
+          #                                 → "foo.yml"
+          WORKFLOW_FILE="${GITHUB_WORKFLOW_REF#*/.github/workflows/}"
+          WORKFLOW_FILE="${WORKFLOW_FILE%@*}"
+
+          # gh run list 参数：
+          #   --repo "$REPO"             指定仓库
+          #   --workflow "$WORKFLOW_FILE" 只列出该工作流的 run
+          #   --limit 100                最多 100 条（避免一次取太多）
+          #   --json databaseId,status   只输出这两个字段的 JSON
+          #   --jq '...'                 过滤：只保留 status == completed 的 id
+          # 通过管道逐行喂给 while read
+          gh run list \
+            --repo "$REPO" \
+            --workflow "$WORKFLOW_FILE" \
+            --limit 100 \
+            --json databaseId,status \
+            --jq '.[] | select(.status=="completed") | .databaseId' | while read -r run_id; do
+              # 空行跳过（安全防护）
+              [[ -z "$run_id" ]] && continue
+              # 跳过当前 run（不能删自己）
+              [[ "$run_id" == "$CURRENT_RUN_ID" ]] && continue
+              # 删除单个 run；|| true 兜底避免单条失败中断循环
+              gh run delete "$run_id" --repo "$REPO" || true
+            done
+
+      # ======================================================================
+      # 步骤 6：在仓库 B 创建 Release，上传 ./assets 下所有文件
+      # ======================================================================
+      # softprops/action-gh-release 的关键参数：
+      #   repository                 目标仓库（不填则默认当前仓库）
+      #   token                      用于认证的令牌（不填则用 GITHUB_TOKEN）
+      #   fail_on_unmatched_files    一个文件都没匹配到就报错
+      #   overwrite_files            覆盖同名文件
+      #   body                       Release 正文（Markdown）
+      #   tag_name                   使用哪个 tag（不存在则自动创建）
+      #   name                       Release 标题
+      #   files                      要上传的文件（支持 glob）
+      # ======================================================================
+      - name: Step-5 Build New Release on target repo
+        uses: softprops/action-gh-release@v3
+        with:
+          # 目标仓库（从仓库 Variable 读取）
+          repository: ${{ vars.B_REPO }}
+          # 认证令牌（从仓库 Secret 读取 PAT）
+          token: ${{ secrets.B_REPO_TOKEN }}
+          # 如果没有任何文件匹配 ./assets/*，则报错
+          fail_on_unmatched_files: true
+          # 覆盖同名文件（重复上传时不会冲突）
+          overwrite_files: true
+          # Release 正文；用 YAML 块标量 | 保留换行
+          body: |
+            ---
+            ### ${{ env.ISO_NAME }}
+            - **SHA256**: ${{ env.SHA256 }}
+            ---
+
+            ${{ env.DOWNLOAD_LINKS }}
+
+            ---
+          # tag 名称来自用户输入
+          tag_name: "${{ github.event.inputs.tag }}"
+          # Release 标题使用 ISO 文件名
+          name: "${{ github.event.inputs.tag }}"
+          # 上传 ./assets 下所有文件（glob 展开）
+          files: |
+            ./assets/*

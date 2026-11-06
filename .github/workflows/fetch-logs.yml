@@ -1,0 +1,90 @@
+name: fetch-logs
+
+on:
+  workflow_run:
+    workflows:
+      - "update-win10-22h2-x64"
+      - "update-win10-ltsb2016-x64"
+      - "update-win10-ltsc2019-x64"
+      - "update-win10-ltsc2021-x64"
+      - "update-win11-ltsc2024-x64"
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  fetch-logs:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success' # == 'success' or != 'cancelled'
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+    steps:
+      - name: Fetch, ensure release, upload
+        id: fetch
+        run: |
+          case "${{ github.event.workflow_run.name }}" in
+            "update-win10-22h2-x64") TAG="win10-22h2-x64" ;;
+            "update-win10-ltsb2016-x64") TAG="win10-ltsb2016-x64" ;;
+            "update-win10-ltsc2019-x64") TAG="win10-ltsc2019-x64" ;;
+            "update-win10-ltsc2021-x64") TAG="win10-ltsc2021-x64" ;;
+            "update-win11-ltsc2024-x64") TAG="win11-ltsc2024-x64" ;;
+            *) echo "::error::unknown workflow"; exit 1 ;;
+          esac
+
+          OUT="log-$TAG-$RUN_ID.zip"
+
+          DL_ERR=""
+          LAST_ERR=""
+          for i in 1 2 3 4 5 6; do
+            if DL_ERR=$(gh api "/repos/$REPO/actions/runs/$RUN_ID/logs" 2>&1 > "$OUT") && [ -s "$OUT" ]; then
+              break
+            fi
+            LAST_ERR="$DL_ERR"
+            rm -f "$OUT"
+            sleep 10
+          done
+          [ -s "$OUT" ] || { echo "::error::download failed: $LAST_ERR"; exit 1; }
+          echo "asset=$OUT" >> "$GITHUB_OUTPUT"
+
+          gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1 || gh release create "$TAG" --repo "$REPO" --title "$TAG" --notes "auto-created"
+
+          UP_ERR=""
+          ok=0
+          for i in 1 2 3; do
+            if UP_ERR=$(gh release upload "$TAG" "$OUT" --repo "$REPO" --clobber 2>&1); then
+              ok=1
+              break
+            fi
+            echo "upload attempt $i failed, retry in $((i*5))s, failed: $UP_ERR"
+            sleep $((i*5))
+          done
+          [ "$ok" = "1" ] || { echo "::error::upload failed after retries"; exit 1; }
+
+      - name: Fallback upload as artifact
+        if: failure() && steps.fetch.outputs.asset != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ github.event.workflow_run.id }}
+          path: ${{ steps.fetch.outputs.asset }}
+
+      - name: Delete past completed runs
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh run list \
+            --repo "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --limit 100 \
+            --json databaseId,status \
+            --jq '.[] | select(.status=="completed") | .databaseId' | while read -r run_id; do
+              if [ -z "$run_id" ]; then continue; fi
+              if [ "$run_id" = "${{ github.run_id }}" ]; then continue; fi
+              gh run delete "$run_id" --repo "${{ github.repository }}" || true
+            done

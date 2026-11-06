@@ -1,0 +1,25 @@
+name: uup-build-win11-25h2-x64
+run-name: uup-build-win11-25h2-x64-${{ github.run_id }}
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 18 14,29 * *"
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  build:
+    uses: ./.github/workflows/uup-build-iso.yml
+    with:
+      versions: Windows_11_25H2
+      architecture: x64
+      edition: Pro
+      language: Chinese(SC)
+      revision: ""
+      esd: true
+      netfx3: true
+      drivers: false
+    secrets: inherit

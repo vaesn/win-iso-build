@@ -1,0 +1,113 @@
+name: Build Helium Portable with Chrome++
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-portable:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y p7zip-full
+
+      - name: Download helium installer & resolve version
+        id: helium
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p downloads
+          gh release download \
+            --repo "imputnet/helium-windows" \
+            --pattern '*x64-installer.exe' \
+            --dir downloads --clobber
+
+          HELIUM_FILE=$(find downloads -name '*x64-installer.exe' | head -n 1 | xargs -n1 basename)
+          [[ -z "$HELIUM_FILE" ]] && { echo "::error::未找到 x64-installer.exe"; exit 1; }
+
+          # helium_0.20.3.1_x64-installer.exe -> 0.20.3.1_x64
+          VER="${HELIUM_FILE#*_}"
+          VER="${VER%-installer.exe}"
+
+          echo "filename=$HELIUM_FILE" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Helium 版本: $VER"
+
+      - name: Download Chrome++ package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download \
+            --repo "Bush2021/chrome_plus" \
+            --pattern 'Chrome++_*.7z' \
+            --dir downloads --clobber
+
+          CHROME_FILE=$(find downloads -name 'Chrome++_*.7z' | head -n 1 | xargs -n1 basename)
+          [[ -z "$CHROME_FILE" ]] && { echo "::error::未找到 Chrome++_*.7z"; exit 1; }
+          echo "CHROME_FILE=$CHROME_FILE" >> "$GITHUB_ENV"
+          echo "Chrome++ 包: $CHROME_FILE"
+
+      - name: Triple-extract helium to get Helium-bin
+        run: |
+          HELIUM_FILE="${{ steps.helium.outputs.filename }}"
+
+          # 第 1 层：NSIS 自解压 exe
+          mkdir -p stage1
+          7z x -y "downloads/$HELIUM_FILE" -ostage1 > /dev/null
+
+          OUTER=$(find stage1 -name 'helium.7z' | head -n 1)
+          [[ -f "$OUTER" ]] || { echo "::error::未找到第一层 helium.7z"; find stage1 -maxdepth 5; exit 1; }
+
+          # 第 2 层：外层 helium.7z -> 嵌套的内层 helium.7z
+          mkdir -p stage2
+          7z x -y "$OUTER" -ostage2 > /dev/null
+          INNER=$(find stage2 -name 'helium.7z' | head -n 1)
+          [[ -f "$INNER" ]] || { echo "::error::未找到嵌套的 helium.7z"; find stage2 -maxdepth 5; exit 1; }
+
+          # 第 3 层：内层 helium.7z -> Helium-bin
+          mkdir -p stage3
+          7z x -y "$INNER" -ostage3 > /dev/null
+          BIN=$(find stage3 -type d -name 'Helium-bin' | head -n 1)
+          [[ -n "$BIN" ]] || { echo "::error::未找到 Helium-bin"; find stage3 -maxdepth 5 -type d; exit 1; }
+
+          mv "$BIN" ./Helium-bin
+          ls -la Helium-bin | head -20
+
+      - name: Extract Chrome++ and merge x64/App into Helium-bin
+        run: |
+          mkdir -p chrome_plus_extract
+          7z x -y "downloads/${CHROME_FILE}" -ochrome_plus_extract > /dev/null
+
+          APP_DIR=$(find chrome_plus_extract -type d -ipath '*/x64/App' | head -n 1)
+          [[ -n "$APP_DIR" ]] || {
+            echo "::error::未找到 x64/App 目录"
+            find chrome_plus_extract -maxdepth 4 -type d
+            exit 1
+          }
+          echo "Chrome++ App 目录: $APP_DIR"
+
+          # 合并 x64/App 内容到 Helium-bin，再改名
+          cp -a "$APP_DIR"/. Helium-bin/
+          mv Helium-bin App
+          ls -la App | head -20
+
+      - name: Repack as Helium_Portable_<version>.7z
+        run: |
+          VER="${{ steps.helium.outputs.version }}"
+
+          7z a -t7z -mx=9 "Helium_Portable_${VER}.7z" App
+
+          mkdir -p dist
+          mv "Helium_Portable_${VER}.7z" dist/
+          ls -la dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Helium_Portable_${{ steps.helium.outputs.version }}
+          path: dist/*.7z
+          retention-days: 3

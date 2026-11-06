@@ -1,0 +1,481 @@
+name: Build Windows
+run-name: |
+  ${{ inputs.versions }} ${{ fromJSON('{"Pro":"PRO"}')[inputs.edition] }} ${{ fromJSON('{"x64":"X64","arm64":"ARM64"}')[inputs.architecture] }} ${{ fromJSON('{"English(US)":"EN","Chinese(SC)":"ZH-SC","Chinese(TC)":"ZH-TC"}')[inputs.language]}} ${{ inputs.esd && 'ESD' || '' }} ${{ inputs.drivers && 'DRIVERS' || '' }} ${{ inputs.netfx3 && 'NETFX3' || '' }}
+on:
+  workflow_dispatch:
+    inputs:
+      architecture:
+        description: Windows architecture to build
+        type: choice
+        options:
+          - x64
+          - arm64
+        default: x64
+        required: true
+      versions:
+        description: Windows version to build
+        type: choice
+        options:
+          - Windows_10_22H2
+          - Windows_11_25H2
+          - Windows_11_26H2
+        default: Windows_11_26H2
+        required: true
+      edition:
+        description: Windows edition to build
+        type: choice
+        options:
+          - Pro
+        default: Pro
+        required: true
+      language:
+        description: Language
+        type: choice
+        options:
+          - English(US)
+          - Chinese(SC)
+          - Chinese(TC)
+        default: Chinese(SC)
+        required: true
+      revision:
+        description: Revision number (optional)
+        type: string
+        required: false
+      esd:
+        description: Use ESD compression
+        type: boolean
+        required: true
+        default: true
+      netfx3:
+        description: Add .NET Framework 3.5
+        type: boolean
+        required: true
+        default: true
+      drivers:
+        description: Add additional drivers (only x64)
+        type: boolean
+        required: false
+        default: false
+
+  workflow_call:
+    inputs:
+      architecture:
+        type: string
+        required: false
+        default: x64
+      versions:
+        type: string
+        required: false
+        default: Windows_11_26H2
+      edition:
+        type: string
+        required: false
+        default: Pro
+      language:
+        type: string
+        required: false
+        default: Chinese(SC)
+      revision:
+        type: string
+        required: false
+        default: ""
+      esd:
+        type: boolean
+        required: false
+        default: true
+      netfx3:
+        type: boolean
+        required: false
+        default: true
+      drivers:
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  actions: write
+jobs:
+  build:
+    runs-on: ${{ fromJSON('{"x64":"windows-2025","arm64":"windows-11-arm"}')[inputs.architecture] }}
+    steps:
+      - name: 1. Checkout
+        uses: actions/checkout@v7
+
+      - name: 2. Map inputs
+        id: map
+        shell: pwsh
+        run: |
+          $langMap = @{
+            'English(US)'='en-us'
+            'Chinese(SC)'='zh-cn'
+            'Chinese(TC)'='zh-tw'
+          }
+
+          $verMap = @{
+            'Windows_10_22H2' = 'windows-10-22h2'
+            'Windows_11_25H2' = 'windows-11-25h2'
+            'Windows_11_26H2' = 'windows-11-26h2'
+          }
+
+          $langCode = $langMap['${{ inputs.language }}']
+          $verCode  = $verMap['${{ inputs.versions }}']
+
+          $opts = ''
+          if ('${{ inputs.esd }}' -eq 'true')     { $opts += ' -esd' }
+          if (('${{ inputs.drivers }}' -eq 'true') -and ('${{ inputs.architecture }}' -ne 'arm64')) {
+            $opts += ' -drivers'
+          }
+          if ('${{ inputs.netfx3 }}' -eq 'true')  { $opts += ' -netfx3' }
+          if (-not [string]::IsNullOrWhiteSpace('${{ inputs.revision }}')) {
+            $opts += ' -revision "${{ inputs.revision }}"'
+          }
+          $opts = $opts.Trim()
+
+          echo "lang=$langCode"    >> $env:GITHUB_OUTPUT
+          echo "version=$verCode"  >> $env:GITHUB_OUTPUT
+          if ($opts) {
+            echo "options=$opts"   >> $env:GITHUB_OUTPUT
+          }
+
+          $ISO_DIR = if ('${{ inputs.architecture }}' -eq 'arm64') { 'C:/output' } else { 'D:/output' }
+          New-Item -ItemType Directory -Force -Path $ISO_DIR | Out-Null
+          "isodir=$ISO_DIR" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "isodir=$ISO_DIR" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 3. Build Windows
+        id: build_windows
+        working-directory: .
+        shell: pwsh
+        run: |
+          pwsh uup-build-iso.ps1 `
+            ${{ steps.map.outputs.version }} ${{ steps.map.outputs.isodir }} `
+            -architecture ${{ inputs.architecture }} `
+            -edition ${{ inputs.edition }} `
+            -lang ${{ steps.map.outputs.lang }} `
+            ${{ steps.map.outputs.options }}
+
+          $isoName = (Get-Content $env:GITHUB_ENV |
+            Where-Object { $_ -match '^ISO_NAME=' } |
+            Select-Object -Last 1) -replace '^ISO_NAME=', ''
+          if ([string]::IsNullOrEmpty($isoName)) { throw "ISO_NAME not found in GITHUB_ENV" }
+
+          "iso_name=$isoName"  | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ITISONAME=$isoName"  | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 4. Create split zip
+        shell: pwsh
+        run: |
+          $isoDir = "${{ steps.map.outputs.isodir }}"
+          $isoName = $env:ITISONAME
+          $maxVolMB = 1895
+          $reserveMB = 8
+
+          $isoFile = Get-ChildItem -Path $isoDir -Filter '*.ISO' | Select-Object -First 1
+          $isoBaseName = $isoFile.BaseName
+
+          $fullHash = (Get-FileHash -Algorithm SHA256 $isoFile.FullName).Hash.ToLowerInvariant()
+          $shortHash = $fullHash.Substring($fullHash.Length - 8)
+          $isoNewName = "${isoBaseName}_${shortHash}.iso"
+          $isoNewPath = Join-Path -Path $IsoDir -ChildPath $isoNewName
+          Rename-Item -Path $isoFile.FullName -NewName $isoNewName -Force
+
+          $totalMB = [int][Math]::Ceiling($isoFile.Length / 1MB)
+          $volumeCount = [int][Math]::Max(1, [Math]::Ceiling($totalMB / ($maxVolMB - $reserveMB)))
+          $volumeSizeMB = [int][Math]::Ceiling($totalMB / $volumeCount) + $reserveMB
+          $lastVolumeMB = $totalMB - $volumeSizeMB * ($volumeCount - 1)
+          Write-Host "ISO: $([Math]::Round($isoFile.Length / 1GB, 2)) GB ($totalMB MB) → $volumeCount 卷 | 每卷 $volumeSizeMB MB, 末卷 $lastVolumeMB MB"
+
+          $isoMetaFile = Get-ChildItem -Path $isoDir -Filter '*.json' | Select-Object -First 1
+          $isoMeta = Get-Content $isoMetaFile.FullName -Raw | ConvertFrom-Json
+          $isoVersionName = $isoMeta.name
+          $isoBuild = $isoMeta.build
+          $isoLang = '${{ steps.map.outputs.lang }}'
+
+          echo "isoBuild=$isoBuild" >> $env:GITHUB_ENV
+          echo "isoLang=$isoLang" >> $env:GITHUB_ENV
+
+          $isoBuildDate = $isoBaseName.Split('-')[0]
+          $z7FileName = "${isoVersionName}_${isoBuildDate}_${shortHash}"
+
+          echo "Z7_FILE_NAME=$z7FileName" >> $env:GITHUB_ENV
+          echo "iso_Build_Date=$isoBuildDate" >> $env:GITHUB_ENV
+          echo "iso_New_Name=$isoNewName" >> $env:GITHUB_ENV
+          echo "shortHash=$shortHash" >> $env:GITHUB_ENV
+          echo "isoVersionName=$isoVersionName" >> $env:GITHUB_ENV
+
+          $z7FilePath = Join-Path $isoDir "$z7FileName.7z"
+          $volumeSizeArg = "${volumeSizeMB}M"
+
+          & 7z a -t7z -mx=0 -v"$volumeSizeArg" -bsp2 "$z7FilePath" "$isoNewPath"
+
+          if ($LASTEXITCODE -gt 1) {
+              throw "7z Fail，LASTEXITCODE: $LASTEXITCODE"
+          }
+          Get-ChildItem "$z7FilePath.*" | Sort-Object Name | ForEach-Object { Write-Host "Created: $($_.FullName)" }
+
+      - name: 5. Build summary
+        id: build_summary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $isoDir = "${{ steps.map.outputs.isodir }}"
+
+          # ---- metadata ----
+          $isoJsonFile = Get-ChildItem -Path $isoDir -Filter '*.json' | Select-Object -First 1
+          if (-not $isoJsonFile) { throw "No JSON metadata found in $isoDir" }
+          $isoMeta = Get-Content $isoJsonFile.FullName -Raw | ConvertFrom-Json
+
+          $imageNames = @($isoMeta.images | ForEach-Object { $_.name })
+          if ($imageNames.Count -eq 0) { throw "No images found in metadata" }
+
+          if ($imageNames.Count -eq 1) {
+            $finalImageName = $imageNames[0]
+          } elseif ($imageNames[0] -match '^(Windows (?:10|11))\s*(.*)$') {
+            $prefix = $matches[1]
+            $rest = $imageNames | Select-Object -Skip 1 |
+              ForEach-Object { $_ -replace "^$([regex]::Escape($prefix))\s*", '' }
+            $finalImageName = "$($imageNames[0])/$($rest -join '/')"
+          } else {
+            $finalImageName = $imageNames -join '/'
+          }
+
+          # ---- build config row ----
+          $opts = '${{ steps.map.outputs.options }}'
+          $optsRow = $null
+          if (-not [string]::IsNullOrWhiteSpace($opts)) {
+            $descMap = @{
+              '-esd'     = 'Use ESD compression'
+              '-drivers' = 'Add additional drivers'
+              '-netfx3'  = 'Add .NET Framework 3.5'
+            }
+            $items = [System.Collections.Generic.List[string]]::new()
+            $tokens = @($opts -split '\s+' | Where-Object { $_ })
+            for ($i = 0; $i -lt $tokens.Count; $i++) {
+              $t = $tokens[$i]
+              $k = $t.ToLowerInvariant()
+              if ($descMap.ContainsKey($k)) {
+                $items.Add($descMap[$k])
+              } elseif ($k -eq '-revision') {
+                $i++   # skip its value
+              } elseif ($t.StartsWith('-')) {
+                $items.Add($t.TrimStart('-'))
+              }
+            }
+            $items = @($items | Select-Object -Unique)
+            if ($items.Count -gt 0) {
+              $optsFormatted = ($items | ForEach-Object { "<li>$_</li>" }) -join ''
+              $optsRow = "| Build config | <ul>$optsFormatted</ul> |"
+            }
+          }
+
+          # ---- volume parts (single enumeration) ----
+          $volParts = @(
+            Get-ChildItem -Path $isoDir -File -Filter "$($env:Z7_FILE_NAME).7z.*" |
+              Where-Object { $_.Name -match '\.7z\.\d+$' } |
+              Sort-Object { [int]($_.Name -replace '^.*\.7z\.', '') }
+          )
+          if ($volParts.Count -eq 0) { throw "No 7z volume files found in $isoDir" }
+          $firstPart = $volParts[0].Name
+          $lastPart  = $volParts[-1].Name
+          $partCount = $volParts.Count
+
+          # ---- download table ----
+          $repo    = $env:GITHUB_REPOSITORY
+          $tag     = $env:iso_Build_Date
+          $baseUrl = "https://v4.gh-proxy.org/https://github.com/$repo/releases/download/$tag"
+          $tableRows = ($volParts | ForEach-Object {
+            $name    = $_.Name
+            $urlName = [uri]::EscapeDataString($name)
+            $idx     = [int]($name -replace '^.*\.7z\.', '')
+            $ext     = [regex]::Match($name, '\.7z\.\d+$').Value
+            "| $idx | ``$name`` | [下载$ext]($baseUrl/$urlName) |"
+          }) -join "`n"
+          $downloadLinks = @(
+            "| Volume | File Name | Link |"
+            "| --- | --- | --- |"
+            $tableRows
+          ) -join "`n"
+
+          # ---- assemble summary ----
+          $summaryParts = [System.Collections.Generic.List[string]]::new()
+          $summaryParts.Add("### FILE INFO")
+          $summaryParts.Add("")
+          $summaryParts.Add("| Property | Value |")
+          $summaryParts.Add("| :--- | :--- |")
+          $summaryParts.Add("| Name | $finalImageName $($isoMeta.version) |")
+          $summaryParts.Add("| Build | $($isoMeta.build) |")
+          $summaryParts.Add("| Architecture | ${{ inputs.architecture }} |")
+          $summaryParts.Add("| Language | ${{ inputs.language }} |")
+          if ($optsRow) { $summaryParts.Add($optsRow) }
+          $summaryParts.Add("| Checksum | $($isoMeta.checksum) |")
+          $summaryParts.Add("| UUP dump | [$($isoMeta.title)]($($isoMeta.uupDump.downloadUrl)) |")
+          $summaryParts.Add("")
+          $summaryParts.Add("### DOWNLOAD")
+          $summaryParts.Add("")
+          $summaryParts.Add($downloadLinks)
+          $summaryText = $summaryParts -join "`n"
+
+          # ---- write summary.md + step summary ----
+          [IO.File]::WriteAllText((Join-Path $PWD 'summary.md'), ($summaryText + "`n<br/>`n"), [Text.UTF8Encoding]::new($false))
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summaryText -Encoding utf8
+
+          # ---- export env ----
+          Add-Content -Path $env:GITHUB_ENV -Encoding utf8 -Value @(
+            "FIRST_PART=$firstPart"
+            "LAST_PART=$lastPart"
+            "PART_COUNT=$partCount"
+            "DOWNLOAD_BASE_URL=$baseUrl"
+            "DOWNLOAD_LINKS<<EOF"
+            $downloadLinks
+            "EOF"
+            "build=$($isoMeta.build)"
+            "version=$($isoMeta.version)"
+            "name=$($isoMeta.name)"
+            "title=$($isoMeta.title)"
+            "images=$finalImageName"
+            "iso_checksum=$($isoMeta.checksum)"
+            "tagname=$($env:iso_Build_Date)"
+          )
+
+          # ---- log ----
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "  Dynamic Download Links" -ForegroundColor Cyan
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host "Base URL      : $baseUrl"
+          Write-Host "First Part    : $firstPart"
+          Write-Host "Last Part     : $lastPart"
+          Write-Host "Part Count    : $partCount"
+          Write-Host "Download Links:"
+          Write-Host $downloadLinks
+          Write-Host "========================================" -ForegroundColor Cyan
+
+      - name: 6. Delete Old Release
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag = "${{ env.tagname }}"
+          $tag_prefix = $tag.Split('.')[0]
+          Write-Host "Matching prefix: $tag_prefix"
+
+          $releases = gh release list --limit 20 --json tagName | ConvertFrom-Json
+          $targets = $releases | Where-Object {
+            $_.tagName -like "$tag_prefix.*" -and $_.tagName -ne $tag
+          }
+
+          foreach ($r in $targets) {
+            $t = $r.tagName
+            Write-Host "Deleting release: $t"
+            gh release delete $t --cleanup-tag -y
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "Failed to delete release: $t, continue..."
+            }
+          }
+
+      - name: 7. Create Release
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ env.tagname }}
+          name: ${{ env.images }} ${{ inputs.architecture}} ${{ env.version }} (${{ env.build }})
+          body_path: summary.md
+          draft: false
+          prerelease: ${{ !contains(fromJson('["Windows_10_22H2","Windows_11_25H2","Windows_11_26H2"]'), inputs.versions) }}
+          files: |
+            ${{ inputs.architecture == 'arm64' && 'C:/output/*.7z.*' || 'D:/output/*.7z.*' }}
+
+      - name: 8. Delete past completed runs of this workflow
+        if: ${{ success() }}
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh run list \
+            --branch "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --workflow "${{ github.workflow }}" \
+            --limit 20 \
+            --json databaseId,status \
+            --jq '.[] | select(.status=="completed") | .databaseId' | while read -r run_id; do
+              if [ -z "$run_id" ]; then continue; fi
+              if [ "$run_id" = "${{ github.run_id }}" ]; then continue; fi
+              gh run delete "$run_id" --repo "${{ github.repository }}" || true
+            done
+
+      - name: 9. Update README
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $newTimeNow = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd HH:mm:ss")
+          $fileName   = $env:iso_New_Name
+          $marker     = "uup-${{ steps.map.outputs.version }}"
+          $branch     = "${{ github.event.repository.default_branch }}"
+
+          $markerRegex = ($marker -replace '[^A-Za-z0-9]', '[-_]')
+          $pattern     = "(?is)(<!--\s*$markerRegex\s*-->).*?(<!--\s*/\s*$markerRegex\s*-->)"
+          Write-Host "Marker : [$marker]"
+          Write-Host "Pattern: [$pattern]"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $pushed  = $false
+          $skipped = $false
+
+          for ($attempt = 0; $attempt -lt 5; $attempt++) {
+            git fetch origin $branch
+            git reset --hard "origin/$branch"
+
+            $readmeOriginal = Get-Content README.md -Raw -Encoding utf8
+            $repo       = $env:GITHUB_REPOSITORY
+            $tag        = "${{ env.tagname }}"
+            $releaseUrl = "https://github.com/$repo/releases/tag/$tag"
+            $link       = '[{0}]({1})' -f $fileName, $releaseUrl
+            $replacement = "<!-- $marker -->`n$link`n`n($newTimeNow UTC)`n<!-- /$marker -->"
+
+            if ($readmeOriginal -notmatch $pattern) {
+              $found = [regex]::Matches($readmeOriginal, '<!--[^>]*-->') | ForEach-Object { $_.Value } | Sort-Object -Unique
+              Write-Host "::error::README 中未找到标记 '$marker'"
+              Write-Host "期望模式: $pattern"
+              Write-Host "README 中现有注释标记:"
+              $found | ForEach-Object { Write-Host "  $_" }
+              throw "Marker '$marker' not found in README.md"
+            }
+
+            $safeReplacement = $replacement.Replace('$', '$$')
+            $readmeUpdated   = [regex]::Replace($readmeOriginal, $pattern, $safeReplacement)
+
+            if ($readmeUpdated -eq $readmeOriginal) {
+              Write-Host "README 内容与替换结果相同，跳过提交"
+              $skipped = $true
+              break
+            }
+
+            [IO.File]::WriteAllText("$PWD/README.md", $readmeUpdated, [Text.UTF8Encoding]::new($false))
+            git add README.md
+            git commit -m "update"
+            if ($LASTEXITCODE -ne 0) {
+              Write-Warning "git commit 失败（第 $($attempt + 1) 次），重试..."
+              Start-Sleep 3
+              continue
+            }
+
+            git push
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "README 已更新并推送"
+              $pushed = $true
+              break
+            }
+            Write-Warning "git push 失败（第 $($attempt + 1) 次），重试..."
+            Start-Sleep 3
+          }
+
+          if (-not $pushed -and -not $skipped) {
+            Write-Host "::warning::README update push failed after 5 attempts"
+          }
